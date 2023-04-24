@@ -189,6 +189,17 @@ static void call_finished_handler(anjay_send_entry_t *entry, int result) {
     ANJAY_MUTEX_LOCK_AFTER_CALLBACK(anjay_locked);
 }
 
+static void clear_entry(void *entry_) {
+    anjay_send_entry_t *entry = (anjay_send_entry_t *) entry_;
+    entry->exchange_status.id = AVS_COAP_EXCHANGE_ID_INVALID;
+    AVS_LIST(anjay_send_entry_t) *entry_ptr =
+        (AVS_LIST(anjay_send_entry_t) *)AVS_LIST_FIND_PTR(
+            &entry->anjay->sender.entries, entry);
+    assert(entry_ptr);
+    assert(*entry_ptr == entry);
+    delete_send_entry(entry_ptr);
+}
+
 static void response_handler(avs_coap_ctx_t *ctx,
                              avs_coap_exchange_id_t exchange_id,
                              avs_coap_client_request_state_t state,
@@ -362,6 +373,75 @@ static bool is_deferrable_condition(anjay_send_result_t condition) {
            || condition == ANJAY_SEND_ERR_BOOTSTRAP;
 }
 
+static avs_error_t start_send_exchange_noc(anjay_send_entry_t *entry,
+                                       anjay_connection_ref_t connection) {
+    assert(!avs_coap_exchange_id_valid(entry->exchange_status.id));
+    assert(!entry->exchange_status.memstream);
+    assert(!entry->exchange_status.out_ctx);
+    assert(!entry->exchange_status.output_state);
+
+    assert(connection.server);
+    assert(_anjay_server_ssid(connection.server) == entry->target_ssid);
+
+    if (!_anjay_connection_get_online_socket(connection)) {
+        if (_anjay_schedule_refresh_server(connection.server,
+                                           AVS_TIME_DURATION_ZERO)) {
+            return avs_errno(AVS_ENOMEM);
+        } else {
+            // once the connection is up, _anjay_send_sched_retry_deferred()
+            // will be called; we're done here
+            return AVS_OK;
+        }
+    }
+
+    avs_coap_ctx_t *coap = _anjay_connection_get_coap(connection);
+    if (!coap) {
+        return avs_errno(AVS_EBADF);
+    }
+
+    uint16_t content_format = _anjay_default_hierarchical_format(
+            _anjay_server_registration_info(connection.server)->lwm2m_version);
+
+    const anjay_url_t *server_uri = _anjay_connection_uri(connection);
+    assert(server_uri);
+
+    avs_coap_request_header_t request = {
+        .code = AVS_COAP_CODE_POST
+    };
+
+    anjay_uri_path_t base_path = MAKE_ROOT_PATH();
+    _anjay_batch_update_common_path_prefix(&(const anjay_uri_path_t *) { NULL },
+                                           &base_path, entry->payload_batch);
+
+    avs_error_t err;
+    if (avs_is_err((err = avs_coap_options_dynamic_init(&request.options)))
+            || avs_is_err(
+                       (err = setup_send_options(&request.options, server_uri,
+                                                 content_format)))) {
+        goto finish;
+    }
+
+    if (!(entry->exchange_status.memstream = avs_stream_membuf_create())
+            || !(entry->exchange_status.out_ctx =
+                         _anjay_output_senml_like_create(
+                                 entry->exchange_status.memstream, &base_path,
+                                 content_format))) {
+        send_log(ERROR, _("out of memory"));
+        goto finish;
+    }
+    entry->exchange_status.expected_offset = 0;
+    entry->exchange_status.serialization_time = avs_time_real_now();
+    err = avs_coap_client_send_async_request(coap, &entry->exchange_status.id,
+                                             &request, request_payload_writer,
+                                             entry, NULL, entry);
+finish:
+    avs_coap_options_cleanup(&request.options);
+    if (avs_is_err(err)) {
+        clear_exchange_status(&entry->exchange_status);
+    }
+    return err;
+}
+
 static anjay_send_result_t
 check_send_possibility(anjay_unlocked_t *anjay,
                        anjay_ssid_t ssid,
@@ -450,6 +530,42 @@ send_impl(anjay_unlocked_t *anjay,
     return ANJAY_SEND_OK;
 }
 
+static anjay_send_result_t
+send_impl_noc(anjay_unlocked_t *anjay,
+          anjay_ssid_t ssid,
+          bool deferrable,
+          const anjay_send_batch_t *data,
+          anjay_send_finished_handler_t *finished_handler,
+          void *finished_handler_data) {
+    anjay_connection_ref_t ref = {
+        .server = NULL
+    };
+    anjay_send_result_t result = check_send_possibility(anjay, ssid, &ref);
+    bool should_defer = (deferrable && is_deferrable_condition(result));
+    if (result != ANJAY_SEND_OK && !should_defer) {
+        return result;
+    }
+
+    AVS_LIST(anjay_send_entry_t) *entry_ptr =
+            create_exchange(anjay, ssid, deferrable, finished_handler,
+                            finished_handler_data, data);
+    if (!entry_ptr || !*entry_ptr) {
+        return ANJAY_SEND_ERR_INTERNAL;
+    }
+
+    if (!should_defer) {
+        assert(ref.server);
+        if (avs_is_err(start_send_exchange_noc(*entry_ptr, ref))) {
+            delete_send_entry(entry_ptr);
+            return ANJAY_SEND_ERR_INTERNAL;
+        }
+    }
+
+    delete_send_entry(entry_ptr);
+    return ANJAY_SEND_OK;
+}
+
+
 anjay_send_result_t
 _anjay_send_deferrable_unlocked(anjay_unlocked_t *anjay,
                                 anjay_ssid_t ssid,
@@ -471,6 +587,19 @@ anjay_send_deferrable(anjay_t *anjay_locked,
     result =
             _anjay_send_deferrable_unlocked(anjay, ssid, data, finished_handler,
                                             finished_handler_data);
+    ANJAY_MUTEX_UNLOCK(anjay_locked);
+    return result;
+}
+
+anjay_send_result_t anjay_send_noc(anjay_t *anjay_locked,
+                               anjay_ssid_t ssid,
+                               const anjay_send_batch_t *data,
+                               anjay_send_finished_handler_t *finished_handler,
+                               void *finished_handler_data) {
+    anjay_send_result_t result = ANJAY_SEND_ERR_INTERNAL;
+    ANJAY_MUTEX_LOCK(anjay, anjay_locked);
+    result = send_impl_noc(anjay, ssid, false, data, finished_handler,
+                       finished_handler_data);
     ANJAY_MUTEX_UNLOCK(anjay_locked);
     return result;
 }

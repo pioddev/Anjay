@@ -513,6 +513,16 @@ anjay_send_result_t anjay_send(anjay_t *anjay,
                                void *finished_handler_data);
 
 /**
+ * Same as @ref anjay_send() but this send without confirmation request 
+ * 
+*/
+anjay_send_result_t anjay_send_noc(anjay_t *anjay,
+                               anjay_ssid_t ssid,
+                               const anjay_send_batch_t *data,
+                               anjay_send_finished_handler_t *finished_handler,
+                               void *finished_handler_data);
+
+/**
  * Sends data to the LwM2M server, either immediately, or deferring it until
  * such operation will be possible.
  *
