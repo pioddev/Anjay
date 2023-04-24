@@ -107,7 +107,7 @@ static int perform_send(anjay_unlocked_t *anjay,
                         anjay_iid_t iid,
                         void *batch) {
     (void) obj;
-    anjay_ssid_t ssid;
+    anjay_ssid_t ssid = 0;
     const anjay_uri_path_t ssid_path =
             MAKE_RESOURCE_PATH(ANJAY_DM_OID_SERVER, iid,
                                ANJAY_DM_RID_SERVER_SSID);
